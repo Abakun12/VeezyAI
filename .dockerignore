@@ -1,0 +1,34 @@
+# Môi trường ảo Python
+.venv/
+venv/
+ENV/
+
+# Bytecode Python và cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# File cấu hình IDE
+.idea/
+.vscode/
+
+# File hệ điều hành
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Các file build và distribution
+build/
+dist/
+*.egg-info/
+
+# File test hoặc dữ liệu không cần thiết trong image production
+tests/
+# img/ # Cân nhắc nếu ảnh trong này chỉ để test local và không cần trong image
+# Webcame/ # Thư mục chứa script test webcam có thể không cần trong image production
+test.py
+test_2.py
+# Thêm các file hoặc thư mục khác bạn không muốn đưa vào image
