@@ -7,4 +7,4 @@ opencv-python                ==4.11.0.86
 scikit-learn                 ==1.6.1
 tensorflow                   ==2.19.0
 tf_keras                     ==2.19.0
-pymongo[srv]                 ==3.12
+pymongo[srv]

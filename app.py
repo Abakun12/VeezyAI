@@ -89,7 +89,7 @@ def enroll_face_endpoint():
 def verify_face_endpoint():
     return verify_face()
 
-@app.route('/ai/identify', methods=['POST'])
+@app.route('/ai/identify',methods=['POST'])
 def identify_face_endpoint():
     return identify_face_from_image_and_db()
 
