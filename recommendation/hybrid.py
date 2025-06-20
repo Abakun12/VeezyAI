@@ -1,42 +1,40 @@
-from .content_based import get_cbf_scores
-from .collaborative import get_similarity_matrix, get_cf_recommendations
+import pandas as pd
+import numpy as np
+import logging
+import config
+from .content_based import build_user_profiles, get_cbf_recommendations
+from .collaborative import get_cf_recommendations_sklearn
 
-def get_hybrid_recommendations(user_id, active_events, interactions_df, user_preferences, top_k, alpha=0.6):
-    """
-    Tạo gợi ý sự kiện bằng mô hình Hybrid (Content-Based + Collaborative Filtering).
+logger = logging.getLogger(__name__)
 
-    Args:
-        user_id (str): ID của người dùng.
-        active_events (list): Danh sách các sự kiện đang hoạt động.
-        interactions_df (pd.DataFrame): DataFrame chứa dữ liệu tương tác.
-        user_preferences (dict): Sở thích người dùng.
-        alpha (float): Trọng số cho CBF (0 <= alpha <= 1).
-        top_k (int): Số lượng gợi ý tối đa.
+def get_recommendations_for_user(account_id, users_df, events_df, feedback_df, event_profiles, cf_model_info, top_k=5):
+    utility_matrix = cf_model_info.get('utility_matrix')
+    events_user_interacted = feedback_df[feedback_df['accountId'] == account_id]['eventId'].unique()
 
-    Returns:
-        list: Danh sách eventId được gợi ý.
-    """
-    # Tính điểm CBF
-    cbf_scores = get_cbf_scores(active_events, user_preferences)
+    if utility_matrix is None or account_id not in utility_matrix.index:
+        logger.info(f"Người dùng '{account_id}' là người dùng mới (cold start).")
+        logger.info("Fallback: Gợi ý các sự kiện phổ biến nhất.")
+        popularity_scores = feedback_df.groupby('eventId')['rating'].agg(['mean', 'count']).reset_index()
+        popularity_scores['popularity_score'] = popularity_scores['mean'] * np.log1p(popularity_scores['count'])
+        popular_events = popularity_scores.sort_values('popularity_score', ascending=False)
+        top_popular = popular_events[~popular_events['eventId'].isin(events_user_interacted)]
+        return top_popular['eventId'].head(top_k).to_list()
 
-    # Tính ma trận tương đồng cho CF
-    sim_df = get_similarity_matrix(interactions_df)
+    # --- NẾU KHÔNG PHẢI COLD START, THỰC HIỆN HYBRID ---
+    final_scores = {}
+    alpha = config.HYBRID_ALPHA
 
-    # Lấy gợi ý từ CBF
-    sorted_cbf_suggestions = sorted(cbf_scores.items(), key=lambda x: x[1], reverse=True)
-    cbf_suggestions = [eid for eid,  _ in sorted_cbf_suggestions]
+    user_profile_vector = build_user_profiles(account_id, feedback_df, event_profiles)
+    cbf_recs = get_cbf_recommendations(user_profile_vector, event_profiles, events_user_interacted, top_k * 2)
+    for event_id, score in cbf_recs.items():
+        final_scores[event_id] = final_scores.get(event_id, 0) + alpha * score
 
-    # Lấy gợi ý từ CF
-    cf_suggestions = get_cf_recommendations(user_id,sim_df, interactions_df, top_k)
-
-    # Kết hợp CBF và CF
-    all_event_ids = set(cbf_suggestions) | set(cf_suggestions)
-    hybrid_scores = {}
-    for eid in all_event_ids:
-        cbf = cbf_scores.get(eid, 0)
-        cf = 1 if eid in cbf_suggestions else 0
-        hybrid_scores[eid] = alpha * cbf + (1-alpha) * cf
-
-    sorted_recs = sorted(hybrid_scores.items(), key=lambda x: x[1], reverse=True)
-    return [eid for eid, _ in sorted_recs[:top_k]]
-
+    cf_recs = get_cf_recommendations_sklearn(account_id, cf_model_info, events_user_interacted, top_k * 2)
+    cf_scores = list(cf_recs.values())
+    if cf_scores:
+        min_score, max_score = min(cf_scores), max(cf_scores)
+        for event_id, score in cf_recs.items():
+            norm_score = (score - min_score) / (max_score - min_score) if (max_score - min_score) > 0 else 0
+            final_scores[event_id] = final_scores.get(event_id, 0) + (1 - alpha) * norm_score
+    sorted_recs = sorted(final_scores.items(), key=lambda x: x[1], reverse=True)
+    return [event_id for event_id, score in sorted_recs[:top_k]]

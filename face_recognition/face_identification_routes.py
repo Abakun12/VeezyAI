@@ -141,10 +141,10 @@ def identify_face_from_image_and_db():
 
         for person_data in known_people_from_db:
             stored_embedding_vector = person_data.get("embedding")
-            current_user_id = person_data.get("user_id")
+            current_user_id = person_data.get("_id")
 
             if not stored_embedding_vector or not isinstance(stored_embedding_vector, list):
-                logger.warning(f"Bỏ qua user_id: {current_user_id} do thiếu embedding hoặc embedding không hợp lệ.")
+                logger.warning(f"Bỏ qua _id: {current_user_id} do thiếu embedding hoặc embedding không hợp lệ.")
                 continue
 
             try:
@@ -166,30 +166,30 @@ def identify_face_from_image_and_db():
                 current_distance = verification_result["distance"]
                 threshold_from_verify = verification_result["threshold"]  # Lấy ngưỡng model đã dùng
 
-                # logger.debug(f"So sánh với {person_data.get('name', current_user_id)}: verified={verification_result['verified']}, distance={current_distance:.4f}, threshold={threshold_from_verify}")
+                # logger.debug(f"So sánh với {person_data.get('username', current_user_id)}: verified={verification_result['verified']}, distance={current_distance:.4f}, threshold={threshold_from_verify}")
 
                 if verification_result["verified"] and current_distance < min_distance_found:
                     min_distance_found = current_distance
                     best_match_person_info = person_data
 
             except ValueError as ve_verify:  # Lỗi từ DeepFace.verify
-                logger.debug(f"Lỗi verify khi so sánh với {person_data.get('name', current_user_id)}: {ve_verify}")
+                logger.debug(f"Lỗi verify khi so sánh với {person_data.get('username', current_user_id)}: {ve_verify}")
                 # Nếu lỗi là không tìm thấy mặt trong live_img_cv2, nó sẽ raise ở lần verify đầu tiên
                 # và được bắt bởi try-except bên ngoài.
             except Exception as e_verify:
                 logger.error(
-                    f"Lỗi không xác định khi verify với {person_data.get('name', current_user_id)}: {e_verify}")
+                    f"Lỗi không xác định khi verify với {person_data.get('username', current_user_id)}: {e_verify}")
 
         if best_match_person_info:
-            user_id_found = best_match_person_info.get("user_id")
-            user_name_found = best_match_person_info.get("name", user_id_found)
+            user_id_found = best_match_person_info.get("_id")
+            user_name_found = best_match_person_info.get("username", user_id_found)
             logger.info(
                 f"Kết quả nhận diện 1:N (DB): Tìm thấy {user_name_found} (ID: {user_id_found}) với khoảng cách {min_distance_found:.4f}")
             return jsonify({
                 "message": "Nhận diện khuôn mặt thành công. Người dùng được xác định.",
                 "identified_person": {
-                    "user_id": user_id_found,
-                    "name": user_name_found,
+                    "_id": user_id_found,
+                    "username": user_name_found,
                     "distance": round(min_distance_found, 4),
                     "threshold_used": threshold_from_verify  # Trả về ngưỡng mà DeepFace đã dùng
                 },
