@@ -1,5 +1,5 @@
 import os
-
+import config
 from flask import request, jsonify, current_app
 from deepface import DeepFace
 from pymongo import MongoClient
@@ -10,9 +10,9 @@ import logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-MODEL_NAME = "Facenet"
-DETECTOR_NAME = "retinaface"
-DISTANCE_METRIC = "cosine"
+MODEL_NAME = config.MODEL_NAME
+DETECTOR_NAME = config.DETECTOR_NAME
+DISTANCE_METRIC = config.DISTANCE_METRIC
 
 
 # --- Cấu hình Kết nối MongoDB ---
