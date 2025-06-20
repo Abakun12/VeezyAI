@@ -1,6 +1,6 @@
 import os
 
-from flask import request, jsonify
+from flask import request, jsonify, current_app
 from deepface import DeepFace
 from pymongo import MongoClient
 import numpy as np
