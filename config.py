@@ -11,6 +11,11 @@ ATTENDANCE_COLLECTION = "Attendance"
 FEEDBACK_COLLECTION = "Feedback"
 FOLLOW_COLLECTION = "Follow"
 
+
+MODEL_NAME = "Facenet"
+DETECTOR_NAME = "retinaface"
+DISTANCE_METRIC = "cosine"
+
 # --- Collaborative Filtering ---
 CF_N_COMPONENTS = 10
 
