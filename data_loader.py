@@ -19,7 +19,7 @@ def load_data_from_mongodb():
         logger.info(f"Kết nối tới MongoDB thành công. '{config.MONGO_DB_NAME}'")
 
         query_filter = {"isActive": True}
-        projection = {"tags": 1, "categoryId": 1, "eventName": 1, "isActive": 1}
+        projection = {"eventName": 1, "tags": 1, "categoryId": 1,"isActive": 1}
         events_cursor  = db[config.EVENTS_COLLECTION].find(query_filter, projection)
         events_df = pd.DataFrame(list(events_cursor))
         if not events_df.empty:
@@ -74,3 +74,27 @@ def load_sample_data():
     feedback_df = pd.DataFrame(feedback_data)
     logger.info("✓ Dữ liệu mẫu đã sẵn sàng.")
     return users_df, events_df, feedback_df
+
+def get_reviews_for_event(event_id: str):
+
+    logger.info(f"Đang truy vấn các bình luận cho EventId: {event_id}")
+    mongo_client = None
+    try:
+        mongo_client = MongoClient(config.MONGO_CONN_STR, serverSelectionTimeoutMS=5000)
+        db = mongo_client[config.MONGO_DB_NAME]
+        comment_collection = db[config.COMMENT_COLLECTION]
+
+        query = {"eventId": event_id, "content": {"$exists": True, "$ne": ""}}
+        projection = {"content": 1, "_id": 0}
+
+        reviews_cursor = comment_collection.find(query, projection)
+        reviews = [doc.get("content") for doc in reviews_cursor if doc.get("content")]
+
+        logger.info(f"-> Tìm thấy {len(reviews)} bình luận cho EventId: {event_id}")
+        return reviews
+    except Exception as e:
+        logger.exception(f"LỖI: Không thể truy vấn các bình luận cho EventId: {event_id}: {e}")
+        return []
+    finally:
+        if mongo_client:
+            mongo_client.close()

@@ -44,6 +44,7 @@ def enroll_face():
                 model_name=MODEL_NAME,
                 detector_backend=DETECTOR_NAME,
                 enforce_detection=True,
+                anti_spoofing=True,
                 align=True
             )
 
@@ -73,8 +74,16 @@ def enroll_face():
             return jsonify(response_data), 200
 
         except ValueError as ve:
-            logger.error(f"Lỗi xử lý khuôn mặt (ValueError): {str(ve)}")
-            return jsonify({"error": f"Lỗi phát hiện khuôn mặt: {str(ve)}"}), 400
+            error_message = str(ve).lower()  # Chuyển thông báo lỗi về chữ thường để dễ kiểm tra
+            logger.error(f"Lỗi xử lý khuôn mặt (ValueError): {error_message}")
+
+            # Kiểm tra xem thông báo lỗi có chứa manh mối về giả mạo không
+            if 'spoof' in error_message or 'real-time face liveness' in error_message:
+                logger.warning("Cảnh báo giả mạo: Khuôn mặt có thể không phải người thật.")
+                return jsonify({"error": "Phát hiện hành vi đáng ngờ. Vui lòng sử dụng ảnh chụp trực tiếp."}), 403
+            else:
+                # Nếu là lỗi ValueError khác (ví dụ: không tìm thấy khuôn mặt)
+                return jsonify({"error": f"Lỗi phát hiện khuôn mặt: {str(ve)}"}), 400
         except Exception as e:
             logger.exception(f"Lỗi không xác định: {str(e)}")
             return jsonify({"error": f"Đã xảy ra lỗi nội bộ: {str(e)}"}), 500
@@ -93,7 +102,8 @@ def preload_models():
         DeepFace.extract_faces(
             img_path=dummy_img,
             detector_backend=DETECTOR_NAME,
-            enforce_detection=False
+            enforce_detection=False,
+            anti_spoofing=True
         )
         logger.info(f"Các mô hình AI ({MODEL_NAME}, {DETECTOR_NAME}) đã sẵn sàng.")
     except Exception as e:

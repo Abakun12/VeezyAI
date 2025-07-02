@@ -2,10 +2,25 @@ import pandas as pd
 import numpy as np
 import logging
 import config
-from .content_based import build_user_profiles, get_cbf_recommendations
-from .collaborative import get_cf_recommendations_sklearn
-
+from .content_based import build_user_profiles, get_cbf_recommendations, build_event_profiles
+from .collaborative import get_cf_recommendations_sklearn, train_cf_model_sklearn
+import data_loader
 logger = logging.getLogger(__name__)
+
+
+def initialize_and_train():
+    """
+    Hàm này được gọi một lần duy nhất khi server khởi động.
+    """
+    global USERS_DF, EVENTS_DF, FEEDBACK_DF, EVENT_PROFILES, CF_MODEL_INFO
+    logger.info("Đang tạo model CF và tạo dữ liệu mẫu...")
+    try:
+        USERS_DF, EVENTS_DF, FEEDBACK_DF = data_loader.load_data_from_mongodb()
+        EVENT_PROFILES, _= build_event_profiles(EVENTS_DF)
+        CF_MODEL_INFO = train_cf_model_sklearn(USERS_DF)
+        logger.info("--- KẾT THÚC PHA OFFLINE. SERVER SẴN SÀNG NHẬN REQUEST. ---")
+    except Exception as e:
+        logger.exception(f"Lỗi khi tạo model CF và dữ liệu mẫu: {e}")
 
 def get_recommendations_for_user(account_id, users_df, events_df, feedback_df, event_profiles, cf_model_info, top_k=5):
     utility_matrix = cf_model_info.get('utility_matrix')

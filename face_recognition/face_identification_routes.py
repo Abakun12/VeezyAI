@@ -1,11 +1,13 @@
 import os
 import config
-from flask import request, jsonify, current_app
+from flask import request, jsonify
 from deepface import DeepFace
+from deepface.modules import verification
 from pymongo import MongoClient
 import numpy as np
 import cv2
 import logging
+import json
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -16,8 +18,8 @@ DISTANCE_METRIC = config.DISTANCE_METRIC
 
 
 # --- Cấu hình Kết nối MongoDB ---
-MONGO_CONN_STR  = os.environ.get("MONGO_CONN_STR", "mongodb+srv://thuanchce170133:ZEQ16jqwjtolxbaV@cluster0.ajszsll.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0")
-MONGO_DB_NAME = os.environ.get("MONGO_DB_NAME", "veezy_db")
+MONGO_CONN_STR  = config.MONGO_CONN_STR
+MONGO_DB_NAME = config.MONGO_DB_NAME
 MONGO_COLLECTION_NAME = os.environ.get("MONGO_COLLECTION_NAME", "Accounts")
 
 mongo_client = None
@@ -32,186 +34,216 @@ try:
 except Exception as e:
     logger.exception(f"LỖI KẾT NỐI MONGODB ban đầu: {e}. Service sẽ không thể thực hiện nhận diện dựa trên DB.")
 
-
-def calculate_distance(embedding1, embedding2, metric="cosine"):
+def _find_best_match(live_embedding_vector, known_people_from_db, threshold):
     """
-    Hàm tính khoảng cách giữa 2 vector embedding.
+    Tìm người dùng hiện tại có khoảng cách nhất giữa live_embedding_vector và
+    các embedding của các người dùng trong DB.
     """
-    emb1 = np.array(embedding1, dtype=np.float32).flatten()
-    emb2 = np.array(embedding2, dtype=np.float32).flatten()
+    best_match_person_info = None
+    min_distance_found = float('inf')
 
-    if emb1.shape[0] == 0 or emb2.shape[0] == 0 or emb1.shape != emb2.shape:
-        return float("inf")
+    for person_data in known_people_from_db:
+        stored_embedding_vector = person_data.get("embedding")
+        if not stored_embedding_vector: continue
 
-    if metric == "cosine":
-        dot = np.dot(emb1, emb2)
-        norm1 = np.linalg.norm(emb1)
-        norm2 = np.linalg.norm(emb2)
-        if norm1 == 0 or norm2 == 0:
-            return float("inf")
-        cos_sim = dot / (norm1 * norm2)
+        distance = verification.find_distance(live_embedding_vector, stored_embedding_vector, DISTANCE_METRIC)
+        if distance < min_distance_found and distance <= threshold:
+            min_distance_found = distance
+            best_match_person_info = person_data
+        elif distance < min_distance_found:
+            min_distance_found = distance
+    return best_match_person_info, min_distance_found
 
-        return 1 - cos_sim
-    elif metric == "euclidean":
-        return np.linalg.norm(emb1 - emb2)
-    elif metric == "euclidean_l2":
-        if np.linalg.norm(emb1) == 0 or np.linalg.norm(emb2) == 0:
-            return float("inf")
-        emb1_normalized = emb1 / np.linalg.norm(emb1)
-        emb2_normalized = emb2 / np.linalg.norm(emb2)
-        return np.linalg.norm(emb1_normalized - emb2_normalized)
-    else:
-        logger.error(f"Hàm tính khoảng cách giữa 2 vector embedding không hợp lệ (Invalid metric: {metric})")
-        raise ValueError("Invalid metric")
-
-
+# HÀM MỚI DÀNH RIÊNG CHO VIỆC LOGIN
 def identify_face_from_image_and_db():
     """
-    Nhận diện khuôn mặt 1:N. Nhận file ảnh, AI tự lấy danh sách embedding từ MongoDB.
-    Có thể nhận 'event_id' (tùy chọn từ form data) để lọc phạm vi tìm kiếm trong DB.
+    Nhận diện khuôn mặt 1:N (Tối ưu hiệu năng).
     """
-    global embeddings_collection
-
     if embeddings_collection is None:
-        logger.error("Kết nối MongoDB không được thiết lập. Không thể truy vấn embeddings.")
         return jsonify({"error": "Lỗi cấu hình server: Không thể kết nối cơ sở dữ liệu."}), 500
 
     if 'file' not in request.files:
-        logger.warning("Không có file ảnh nào được cung cấp trong request.")
         return jsonify({"error": "No image file provided"}), 400
 
     live_image_file = request.files['file']
-
     if live_image_file.filename == '':
-        logger.warning("Tên file ảnh trực tiếp trống.")
         return jsonify({"error": "No selected live image file"}), 400
 
     try:
-        live_image_stream = live_image_file.read()
-        np_live_image = np.frombuffer(live_image_stream, np.uint8)
-        live_img_cv2 = cv2.imdecode(np_live_image, cv2.IMREAD_COLOR)
+        # --- BƯỚC 1: Xử lý ảnh live và trích xuất embedding MỘT LẦN DUY NHẤT ---
+        np_live_login = np.frombuffer(live_image_file.read(), np.uint8)
+        live_img_cv2 = cv2.imdecode(np_live_login, cv2.IMREAD_COLOR)
 
         if live_img_cv2 is None:
-            logger.error("Không thể giải mã hình ảnh trực tiếp.")
             return jsonify({"error": "Could not decode live image"}), 400
-        logger.info(f"Đã nhận và giải mã ảnh: {live_image_file.filename} cho nhận diện 1:N (DB)")
 
-        # 1. Trích xuất embedding từ ảnh
+        logger.info("Bắt đầu kiểm tra toàn vẹn ảnh: Số lượng và Liveness...")
+
         try:
-            live_embedding_objs = DeepFace.represent(
+            face_objs = DeepFace.extract_faces(
                 img_path=live_img_cv2,
-                model_name=MODEL_NAME,
                 detector_backend=DETECTOR_NAME,
                 enforce_detection=True,
-                align=True
+                anti_spoofing=True
             )
-            if not live_embedding_objs or not isinstance(live_embedding_objs, list) or not live_embedding_objs[0].get(
-                    'embedding'):
-                logger.warning("Không thể trích xuất embedding từ ảnh live.")
-                return jsonify({"error": "Could not extract embedding from live image"}), 400
-            live_embedding_vector = live_embedding_objs[0]['embedding']
-            logger.info("Đã trích xuất embedding từ ảnh live thành công.")
-        except ValueError as ve_rep:  # Lỗi không tìm thấy mặt trong ảnh
-            logger.error(f"Lỗi khi trích xuất embedding cho ảnh live (1:N DB): {ve_rep}")
-            return jsonify({"error": f"Không thể xử lý ảnh live cho tìm kiếm 1:N: {ve_rep}"}), 400
-        except Exception as e_rep:  # Các lỗi khác khi represent
-            logger.exception(f"Lỗi không xác định khi trích xuất embedding ảnh live: {e_rep}")
-            return jsonify({"error": "Lỗi server khi xử lý ảnh live."}), 500
 
-        # 2. Lấy embedding đã biết từ MongoDB
+            if len(face_objs) != 1:
+                logger.warning(f"Ảnh không hợp lệ. Phát hiện {len(face_objs)} khuôn mặt.")
+                return jsonify({'error': "Vui lòng đảm bảo chỉ có một khuôn mặt trong ảnh."}), 400
 
-        query_filter = {}
-        projection = {"_id": 1, "username": 1, "embedding": 1}
-        try:
-            known_people_from_db = list(embeddings_collection.find(query_filter, projection))
-        except Exception as e_db:
-            logger.exception(f"Lỗi khi truy vấn embeddings từ MongoDB: {e_db}")
-            return jsonify({"error": "Lỗi server khi truy vấn cơ sở dữ liệu."}), 500
+            if not face_objs[0]['is_real']:
+                logger.warning("Cảnh báo giả mạo: Khuôn mặt có thể không phải người thật.")
+                return jsonify({"error": "Phát hiện hành vi đáng ngờ. Vui lòng sử dụng ảnh chụp trực tiếp."}), 403
+        except ValueError as ve:
+            logger.error(f"Lỗi xử lý khuôn mặt (ValueError): {str(ve)}")
+            return jsonify({"error": f"Không thể phát hiện khuôn mặt trong ảnh live: {str(ve)}"}), 400
 
+        # Gọi hàm trích xuất embedding từ ảnh live
+        live_embedding_vector = DeepFace.represent(
+            img_path=live_img_cv2,
+            model_name=MODEL_NAME,
+            detector_backend=DETECTOR_NAME,
+            enforce_detection=True,
+            align=True
+        )[0]['embedding']
+        logger.info("Đã trích xuất embedding từ ảnh live thành công.")
+
+        # --- BƯỚC 2: Lấy dữ liệu từ MongoDB ---
+        known_people_from_db = list(embeddings_collection.find({}, {"_id": 1, "username": 1, "embedding": 1}))
         if not known_people_from_db:
-            logger.info("Không có dữ liệu embedding nào trong DB để so sánh.")
-            return jsonify({"message": "Không có dữ liệu người dùng đã biết trong DB để nhận diện.",
-                            "identified_person": None}), 200
+            return jsonify({"message": "Không có dữ liệu người dùng trong DB.", "identified_person": None}), 200
 
-        logger.info(f"Bắt đầu nhận diện 1:N với {len(known_people_from_db)} người từ DB...")
+        # --- BƯỚC 3: So sánh hiệu quả và tìm người khớp nhất ---
+        threshold = verification.find_threshold(MODEL_NAME, DISTANCE_METRIC)
+        best_match_person, min_distance_found = _find_best_match(live_embedding_vector, known_people_from_db, threshold)
 
-        best_match_person_info = None
-        min_distance_found = float('inf')  # Khởi tạo với giá trị vô cùng lớn
-        threshold_from_verify = None
-
-        for person_data in known_people_from_db:
-            stored_embedding_vector = person_data.get("embedding")
-            current_user_id = person_data.get("_id")
-
-            if not stored_embedding_vector or not isinstance(stored_embedding_vector, list):
-                logger.warning(f"Bỏ qua _id: {current_user_id} do thiếu embedding hoặc embedding không hợp lệ.")
-                continue
-
-            try:
-                # Sử dụng DeepFace.verify để so sánh embedding của ảnh live với từng stored_embedding
-                # DeepFace.verify sẽ tự trích xuất lại embedding từ live_img_cv2 nếu cần,
-                # hoặc có thể tối ưu hơn nếu truyền trực tiếp live_embedding_vector (cần xem tài liệu DeepFace.verify)
-                # Để đảm bảo, ta truyền img1_path là ảnh live, img2_path là embedding đã lưu.
-                verification_result = DeepFace.verify(
-                    img1_path=live_img_cv2,  # Ảnh live
-                    img2_path=np.array(stored_embedding_vector, dtype=np.float32),
-                    # Embedding từ DB, cần là numpy array
-                    model_name=MODEL_NAME,
-                    detector_backend=DETECTOR_NAME,  # Nên dùng để DeepFace tự xử lý việc phát hiện trên img1_path
-                    distance_metric=DISTANCE_METRIC,
-                    align=True,  # DeepFace sẽ tự căn chỉnh img1_path nếu cần
-                    enforce_detection=True  # Đảm bảo khuôn mặt được tìm thấy trong img1_path để so sánh
-                )
-
-                current_distance = verification_result["distance"]
-                threshold_from_verify = verification_result["threshold"]  # Lấy ngưỡng model đã dùng
-
-                # logger.debug(f"So sánh với {person_data.get('username', current_user_id)}: verified={verification_result['verified']}, distance={current_distance:.4f}, threshold={threshold_from_verify}")
-
-                if verification_result["verified"] and current_distance < min_distance_found:
-                    min_distance_found = current_distance
-                    best_match_person_info = person_data
-
-            except ValueError as ve_verify:  # Lỗi từ DeepFace.verify
-                logger.debug(f"Lỗi verify khi so sánh với {person_data.get('username', current_user_id)}: {ve_verify}")
-                # Nếu lỗi là không tìm thấy mặt trong live_img_cv2, nó sẽ raise ở lần verify đầu tiên
-                # và được bắt bởi try-except bên ngoài.
-            except Exception as e_verify:
-                logger.error(
-                    f"Lỗi không xác định khi verify với {person_data.get('username', current_user_id)}: {e_verify}")
-
-        if best_match_person_info:
-            user_id_found = best_match_person_info.get("_id")
-            user_name_found = best_match_person_info.get("username", user_id_found)
-            logger.info(
-                f"Kết quả nhận diện 1:N (DB): Tìm thấy {user_name_found} (ID: {user_id_found}) với khoảng cách {min_distance_found:.4f}")
+        # --- BƯỚC 4: Trả về kết quả ---
+        if best_match_person:
+            user_id_found = str(best_match_person.get("_id"))  # Chuyển ObjectId thành string
+            user_name_found = best_match_person.get("username", user_id_found)
+            #final_distance = verification.find_distance(live_embedding_vector, best_match_person.get("embedding"), DISTANCE_METRIC)
+            final_distance = min_distance_found
+            logger.info(f"Kết quả: Tìm thấy {user_name_found} với khoảng cách {final_distance:.4f}")
             return jsonify({
-                "message": "Nhận diện khuôn mặt thành công. Người dùng được xác định.",
+                "message": "Nhận diện thành công. Đăng nhập được cấp phép.",
                 "identified_person": {
                     "_id": user_id_found,
                     "username": user_name_found,
-                    "distance": round(min_distance_found, 4),
-                    "threshold_used": threshold_from_verify  # Trả về ngưỡng mà DeepFace đã dùng
+                    "distance": round(final_distance, 4),
                 },
-                "login_successful": True
+                "login_successful": True,
+                "threshold_used": threshold
             }), 200
         else:
-            logger.info("Kết quả nhận diện 1:N (DB): Không tìm thấy người nào khớp.")
+            logger.info("Kết quả: Không tìm thấy người nào khớp.")
             return jsonify({
-                "message": "Nhận diện khuôn mặt không thành công. Không tìm thấy người dùng phù hợp.",
+                "message": "Nhận diện không thành công. Không tìm thấy người dùng phù hợp.",
                 "identified_person": None,
                 "login_successful": False,
-                "threshold_that_would_be_used": threshold_from_verify if threshold_from_verify is not None else DeepFace.verification.get_threshold(
-                    MODEL_NAME, DISTANCE_METRIC)  # Cung cấp ngưỡng tham khảo
+                "closest_match_distance": round(min_distance_found, 4) if min_distance_found != float('inf') else None,  # Cung cấp thêm thông tin
+                "threshold_that_was_used": threshold
             }), 200
 
-    except ValueError as ve_outer:  # Lỗi chung khi xử lý ảnh live hoặc dữ liệu đầu vào
-        logger.error(f"Lỗi xử lý yêu cầu nhận diện (ValueError): {str(ve_outer)}")
-        if "Face could not be detected" in str(ve_outer) or "multiple faces" in str(ve_outer):
-            return jsonify({
-                               "error": f"Không thể phát hiện khuôn mặt trong ảnh trực tiếp hoặc phát hiện nhiều hơn một khuôn mặt. (Live image face detection issue: {str(ve_outer)})"}), 400
-        return jsonify({"error": f"Lỗi dữ liệu đầu vào khi nhận diện: {str(ve_outer)}"}), 400
-    except Exception as e_outer:
-        logger.exception(f"Lỗi không xác định trong quá trình nhận diện: {str(e_outer)}")
-        return jsonify({"error": f"Đã xảy ra lỗi nội bộ khi nhận diện: {str(e_outer)}"}), 500
+    except ValueError as ve:
+        logger.error(f"Lỗi xử lý khuôn mặt (ValueError): {str(ve)}")
+        return jsonify({"error": f"Không thể phát hiện khuôn mặt trong ảnh live: {str(ve)}"}), 400
+    except Exception as eb:
+        logger.exception(f"Lỗi không xác định: {str(eb)}")
+        return jsonify({"error": f"Đã xảy ra lỗi nội bộ: {str(eb)}"}), 500
 
+
+# HÀM MỚI DÀNH RIÊNG CHO VIỆC CHECK-IN
+def identify_face_for_check_in():
+    """
+    Nhận diện khuôn mặt 1:N cho chức năng Check-in.
+    Hàm này không quét toàn bộ DB mà chỉ so sánh với một danh sách ứng viên được cung cấp.
+    """
+    # --- BƯỚC 1: Nhận dữ liệu từ request ---
+    if 'file' not in request.files:
+        return jsonify({"error": "Không có file ảnh nào được gửi."}), 400
+
+    live_image_file = request.files['file']
+    if live_image_file.filename == '':
+        return jsonify({"error": "Không có file ảnh nào được chọn."}), 400
+
+    # Nhận danh sách ứng viên từ form data (được gửi từ backend ASP.NET)
+    candidates_json = request.form.get('candidates')
+    if not candidates_json:
+        return jsonify({"error": "Không có danh sách ứng viên (candidates) nào được cung cấp."}), 400
+
+    try:
+        # Chuyển chuỗi JSON thành một list các dictionary
+        candidates_from_request = json.loads(candidates_json)
+        if not isinstance(candidates_from_request, list):
+            raise TypeError("Candidates phải là một danh sách (list).")
+    except (json.JSONDecodeError, TypeError) as eb:
+        logger.error(f"Lỗi phân tích JSON từ candidates: {eb}")
+        return jsonify({"error": "Dữ liệu candidates không phải là JSON list hợp lệ."}), 400
+
+    if not candidates_from_request:
+        return jsonify({"message": "Danh sách ứng viên rỗng."}), 200
+
+    try:
+        # --- BƯỚC 2: Xử lý ảnh live và trích xuất embedding ---
+        np_live_check_in = np.frombuffer(live_image_file.read(), np.uint8)
+        live_img_cv2 = cv2.imdecode(np_live_check_in, cv2.IMREAD_COLOR)
+
+        if live_img_cv2 is None:
+            return jsonify({"error": "Could not decode live image"}), 400
+
+        logger.info("Bắt đầu kiểm tra toàn vẹn ảnh: Số lượng và Liveness...")
+        face_objs = DeepFace.extract_faces(
+            img_path=live_img_cv2,
+            detector_backend=DETECTOR_NAME,
+            enforce_detection=True,
+            anti_spoofing=True
+        )
+
+        if len(face_objs) != 1:
+            return jsonify({'error': "Vui lòng đảm bảo chỉ có một khuôn mặt trong ảnh."}), 400
+        if not face_objs[0]['is_real']:
+            return jsonify({"error": "Phát hiện hành vi đáng ngờ. Vui lòng sử dụng ảnh chụp trực tiếp."}), 403
+
+        live_embedding_vector = DeepFace.represent(
+            img_path=live_img_cv2,
+            model_name=MODEL_NAME,
+            detector_backend=DETECTOR_NAME,
+            enforce_detection=True,
+            align=True
+        )[0]['embedding']
+        logger.info("Check-in: Đã trích xuất embedding từ ảnh live thành công.")
+
+        # --- BƯỚC 3: So sánh với danh sách ứng viên và tìm người khớp nhất ---
+
+        threshold = verification.find_threshold(MODEL_NAME, DISTANCE_METRIC)
+        best_match_person, min_distance_found = _find_best_match(live_embedding_vector, candidates_from_request, threshold)
+
+        # --- BƯỚC 4: Trả về kết quả Check-in ---
+        if best_match_person:
+            user_id_found = best_match_person.get("user_id", "Không rõ")
+            final_distance = min_distance_found
+            logger.info(f"Check-in: Tìm thấy {user_id_found} với khoảng cách {final_distance:.4f}")
+            return jsonify({
+                "message": "Check-in thành công.",
+                "check_in_successful": True,
+                "identified_person": {
+                    "user_id": user_id_found,
+                    "distance": round(final_distance, 4),
+                },
+                "threshold_used": threshold
+            }), 200
+        else:
+            logger.info(f"Check-in: Không tìm thấy người nào khớp. Khoảng cách gần nhất: {min_distance_found:.4f}")
+            return jsonify({
+                "message": "Check-in không thành công. Không tìm thấy người dùng phù hợp trong danh sách.",
+                "check_in_successful": False,
+                "closest_match_distance": round(min_distance_found, 4) if min_distance_found != float('inf') else None,
+                "threshold_that_was_used": threshold
+            }), 200
+
+    except ValueError as ve:
+        logger.error(f"Lỗi xử lý khuôn mặt (ValueError): {str(ve)}")
+        return jsonify({"error": f"Không thể phát hiện khuôn mặt trong ảnh live: {str(ve)}"}), 400
+    except Exception as eb:
+        logger.exception(f"Lỗi không xác định trong quá trình check-in: {str(eb)}")
+        return jsonify({"error": f"Đã xảy ra lỗi nội bộ: {str(eb)}"}), 500
