@@ -84,12 +84,11 @@
       * **Input:** Form-data với một trường `file` chứa file ảnh.
       * **Output:** JSON chứa `embedding_vector` và các thông tin liên quan.
 
-  * **POST `/ai/verify`**
+  * **POST `/ai/identify`**
 
       * **Mục đích:** Xác thực khuôn mặt.
       * **Input:** Form-data với:
           * Trường `file` chứa file ảnh trực tiếp.
-          * Trường `stored_embedding_json` chứa chuỗi JSON của vector embedding đã lưu trữ.
       * **Output:** JSON chứa kết quả `verified` (true/false), `distance`, `threshold`, v.v.
 
 ## Hướng Phát Triển Tiếp Theo (Gợi ý)
