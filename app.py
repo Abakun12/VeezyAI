@@ -303,4 +303,4 @@ def process_chat_request_stream():
 if __name__ == '__main__':
     initialize_and_train()
     preload_models()
-    app.run(host='0.0.0.0', port=5001, debug=True)
+    app.run(host='0.0.0.0', port=5001, debug=False)
