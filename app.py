@@ -222,11 +222,6 @@ def ingest_knowledge():
         knowledge_text += f"Start Time: {event_doc.get('startAt')}. "
         knowledge_text += f"End Time: {event_doc.get('endAt')}. "
 
-        if event_doc.get('bankName'):
-            knowledge_text += f"Payment Information: Bank {event_doc.get('bankName')}, "
-            knowledge_text += f"account number {event_doc.get('bankAccount')}, "
-            knowledge_text += f"account name {event_doc.get('bankAccountName')}. "
-
         tags = event_doc.get('tags', [])
         if tags:
             knowledge_text += f"Related topics: {', '.join(tags)}. "
@@ -300,7 +295,7 @@ def process_chat_request_stream():
                 "$search": {
                     "index": "default",  # Tên index bạn vừa tạo ở trên
                     "text": {
-                        "query": user_question,  # Dùng câu hỏi của người dùng để tìm kiếm
+                        "query": user_question,
                         "path": "content"  # Tìm trong trường "content" của collection chunks
                     }
                 }
