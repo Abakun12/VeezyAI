@@ -1,19 +1,21 @@
 import os
 from flask import Flask, request, jsonify, Response
 import logging
+import joblib
 from flask.cli import load_dotenv
 import google.generativeai as genai
 import config
+import pandas as pd
 import data_loader
 from bson import ObjectId
 from pymongo import MongoClient
-from recommendation.hybrid import get_recommendations_for_user, initialize_and_train
-from face_recognition.face_enroll import enroll_face, preload_models
-from face_recognition.verify_face import verify_face
-from face_recognition.face_identification_routes import identify_face_from_image_and_db, identify_face_for_check_in
+from ticket_suggestion_model.prediction_api import get_features_for_suggestion
+from face_recognition.face_enroll import enroll_or_update_face, preload_models, buy_ticket_by_face
+from face_recognition.face_identification_routes import identify_face_from_image_and_db, identify_face_for_check_in, _initialize_models
 from nlp_service.sentiment_analyzer import SentimentAnalyzer
 from nlp_service.aspect_analyzer import analyze_aspects
 from nlp_service.keyword_extractor import  extract_top_keywords
+from recommendation import hybrid
 
 load_dotenv()
 app = Flask(__name__)
@@ -24,7 +26,7 @@ logger = logging.getLogger(__name__)
 # --- CÁC BIẾN TOÀN CỤC ĐỂ LƯU MODEL VÀ DỮ LIỆU ---
 USERS_DF = None
 EVENTS_DF = None
-FEEDBACK_DF = None
+INTERACTION_DF = None
 EVENT_PROFILES = None
 CF_MODEL_INFO = None
 
@@ -39,6 +41,10 @@ try:
         raise ValueError("Cấu hình Gemini API không hợp lệ.")
     genai.configure(api_key=api_key)
     logger.info("Cấu hình Gemini API đã được thiết lập.")
+
+    model = joblib.load('ticket_suggestion_model/saved_models/ticket_suggestion_model.pkl')
+    model_columns = joblib.load('ticket_suggestion_model/saved_models/suggestion_model_columns.pkl')
+
     if not config.MONGO_CONN_STR:
         raise ValueError("Biến môi trường MONGO_CONN_STR chưa được thiết lập.")
     mongo_client = MongoClient(config.MONGO_CONN_STR)
@@ -49,66 +55,65 @@ try:
 except Exception as e:
     logger.error(f"Lỗi khi thiết lập cấu hình Gemini API: {e}")
 
-@app.before_request
-def setup_models():
-    initialize_and_train()
-
 @app.route('/')
 def index():
     return "Recommendation Service for Veezy AI is running."
 
-@app.route('/recommend', methods=['POST'])
+@app.route('/ai/recommend', methods=['POST'])
 def recommend_for_user_api():
-    """
-    API endpoint để Backend gọi.
-    Mong đợi một JSON body chứa "user_id"
-    Ví dụ: { "user_id": "user_A"}
-    """
-    try:
-        request_data = request.get_json()
-        if not request_data:
-            return jsonify({"error": "Request body phải là JSON."}), 400
+    """API endpoint chính để nhận yêu cầu và trả về gợi ý."""
 
-        user_id = request_data.get('user_id')
-        top_k = 10
+    # BƯỚC 1: Đảm bảo mô hình đã được tải trong worker này.
+    hybrid.ensure_models_are_loaded()
 
-        if not user_id:
-            return jsonify({"error": "Thiếu 'user_id' trong JSON body."}), 400
-
-    except Exception as e:
-        logger.error(f"Lỗi khi xử lý request JSON: {e}")
-        return jsonify({"error": "Request JSON không hợp lệ."}), 400
-
-    logger.info(f"Nhận được yêu cầu gợi ý cho người dùng: {user_id} với top_k={top_k}")
-
-    if EVENT_PROFILES is None or CF_MODEL_INFO is None:
-        logger.error("Các mô hình gợi ý chưa được huấn luyện hoặc có lỗi khi khởi động.")
+    # BƯỚC 2: Kiểm tra lại xem quá trình tải có thành công không.
+    # SỬA LỖI: Truy cập các biến thông qua module 'hybrid'
+    if hybrid.EVENTS_DF is None or hybrid.INTERACTION_DF is None:
+        logger.error("Tải mô hình/dữ liệu thất bại. Dịch vụ chưa sẵn sàng.")
         return jsonify({"error": "Service is not ready, please try again later."}), 503
 
-    if USERS_DF is not None and user_id not in USERS_DF['AccountId'].values:
-        return jsonify({"error": f"Không tìm thấy người dùng với ID: {user_id}"}), 404
-
+    # BƯỚC 3: Xử lý request JSON từ client
     try:
-        recommendations_ids =  get_recommendations_for_user(user_id, USERS_DF, EVENTS_DF, FEEDBACK_DF, EVENT_PROFILES, CF_MODEL_INFO, top_k=top_k)
+        request_data = request.get_json()
+        if not request_data or 'account_id' not in request_data:
+            return jsonify({"error": "Missing 'account_id' in JSON body."}), 400
+        account_id = request_data.get('account_id')
+        top_k = 5
+    except Exception:
+            return jsonify({"error": "Invalid JSON request."}), 400
 
+    logger.info(f"Nhận được yêu cầu gợi ý cho người dùng: {account_id} với top_k={top_k}")
+
+    # SỬA LỖI: Xóa bỏ đoạn kiểm tra không cần thiết gây ra KeyError.
+    # Logic xử lý người dùng mới (cold start) đã có trong hàm get_recommendations_for_user.
+
+    # BƯỚC 4: Gọi hàm logic để lấy gợi ý và trả về kết quả
+    try:
+        recommendations_ids = hybrid.get_recommendations_for_user(account_id, top_k=top_k)
         if not recommendations_ids:
-            return jsonify({ "user_id": user_id, "recommendations": [] })
+            return jsonify({"account_id": account_id, "recommendations": []})
 
-        recommended_events_details = EVENTS_DF[EVENTS_DF['eventId'].isin(recommendations_ids)].to_dict(orient='records')
+        # Lấy chi tiết sự kiện từ EVENTS_DF toàn cục
+        # SỬA LỖI: Truy cập biến thông qua module 'hybrid'
+        recommended_events_details = hybrid.EVENTS_DF[hybrid.EVENTS_DF['eventId'].isin(recommendations_ids)].to_dict(
+            orient='records')
 
+        # Sắp xếp kết quả theo đúng thứ tự đã gợi ý
         ordered_results = sorted(recommended_events_details, key=lambda x: recommendations_ids.index(x['eventId']))
 
-        return jsonify({
-            "user_id": user_id,
-            "recommendations": ordered_results
-        })
+        return jsonify({"account_id": account_id, "recommendations": ordered_results})
     except Exception as e:
-        logger.exception(f"Lỗi khi tạo gợi ý cho người dùng {user_id}: {e}")
-        return jsonify({"error": "Đã xảy ra lỗi nội bộ trong quá trình tạo gợi ý."}), 500
+        logger.exception(f"Lỗi khi tạo gợi ý cho người dùng {account_id}: {e}")
+        return jsonify({"error": "An internal error occurred while generating the suggestion."}), 500
+
 
 @app.route('/ai/enroll', methods=['POST'])
 def enroll_face_endpoint():
-    return enroll_face()
+    return enroll_or_update_face()
+
+@app.route('/ai/buy_ticket_enroll_face', methods=['POST'])
+def buy_ticket_by_face_endpoint():
+    return buy_ticket_by_face()
 
 # @app.route('/ai/verify', methods=['POST'])
 # def verify_face_endpoint():
@@ -130,20 +135,20 @@ def analyze_sentiment_endpoint():
     try:
         request_data = request.get_json()
         if not request_data or 'event_id' not in request_data:
-            return jsonify({"error": "Thiếu 'event_id' trong JSON body."}), 400
+            return jsonify({"error": "Missing 'event_id' in JSON body."}), 400
         event_id = request_data['event_id']
     except Exception:
-        return jsonify({"error": "Request JSON không hợp lệ."}), 400
+        return jsonify({"error": "Invalid JSON request."}), 400
 
     logger.info(f"Nhận được yêu cầu phân tích cảm xúc cho EventId: {event_id}")
 
     reviews = data_loader.get_reviews_for_event(event_id)
     if not reviews:
-        return jsonify({"message": f"Không tìm thấy bình luận cho EventId: {event_id}."}), 404
+        return jsonify({"error": f"No comments found for EventId: {event_id}."}), 404
 
     sentiment_results = sentiment_analyzer.analyze(reviews)
     if not sentiment_results:
-        return jsonify({"error": "Lỗi trong quá trình phân tích cảm xúc."}), 500
+            return jsonify({"error": "Error in sentiment analysis."}), 500
 
     classified_reviews = []
     positive_count, negative_count, neutral_count = 0, 0, 0
@@ -189,43 +194,58 @@ def chunk_text(text, max_words=200):
     words = text.split()
     return [" ".join(words[i:i + max_words]) for i in range(0, len(words), max_words)]
 
-@app.route('/ingest-knowledge', methods=['POST'])
+@app.route('/ai/ingest-knowledge', methods=['POST'])
 def ingest_knowledge():
     """
     Endpoint này được Backend gọi khi một sự kiện được tạo/cập nhật.
     AI Service sẽ tự truy vấn DB để xây dựng cơ sở tri thức.
     """
-    if not mongo_client: return Response("Lỗi dịch vụ: Không thể kết nối DB.", status=503)
+    if not mongo_client:
+        return Response("Service error: Unable to connect to DB.", status=503)
 
     data = request.get_json()
     if not data or 'eventId' not in data:
-        return jsonify({"error": "Thiếu eventId"}), 400
+        return jsonify({"error": "Missing eventId"}), 400
 
     event_id_str = data['eventId']
-    logger.info(f"Bắt đầu xử lý kiến thức cho eventId: {event_id_str}")
+    logger.info(f"Starting knowledge ingestion for eventId: {event_id_str}")
 
     try:
-        # 1. AI Service TỰ TRUY VẤN DB
-        event_doc = events_collection.find_one({"_id": ObjectId(event_id_str)})
-        if not event_doc or "eventDescription" not in event_doc:
-            return jsonify({"error": f"Không tìm thấy sự kiện hoặc mô tả cho eventId: {event_id_str}"}), 404
+        event_doc = events_collection.find_one({"_id": event_id_str})
+        if not event_doc:
+            return jsonify({"error": f"Event not found for eventId: {event_id_str}"}), 404
 
-        # 2. Chia nhỏ và Vector hóa
-        text_chunks = chunk_text(event_doc["eventDescription"])
+        knowledge_text = ""
+        knowledge_text += f"Event Name: {event_doc.get('eventName', 'Not available')}. "
+        knowledge_text += f"Description: {event_doc.get('eventDescription', 'Not available')}. "
+        knowledge_text += f"Location: {event_doc.get('eventLocation', 'Not available')}. "
+        knowledge_text += f"Start Time: {event_doc.get('startAt')}. "
+        knowledge_text += f"End Time: {event_doc.get('endAt')}. "
+
+        if event_doc.get('bankName'):
+            knowledge_text += f"Payment Information: Bank {event_doc.get('bankName')}, "
+            knowledge_text += f"account number {event_doc.get('bankAccount')}, "
+            knowledge_text += f"account name {event_doc.get('bankAccountName')}. "
+
+        tags = event_doc.get('tags', [])
+        if tags:
+            knowledge_text += f"Related topics: {', '.join(tags)}. "
+
+        text_chunks = chunk_text(knowledge_text)
         if not text_chunks:
-            return jsonify({"message": "Không có nội dung để xử lý."}), 200
+            return jsonify({"message": "No content to process."}), 200
 
         embedding_result = genai.embed_content(model="models/text-embedding-004", content=text_chunks,
                                                task_type="RETRIEVAL_DOCUMENT")
         embeddings = embedding_result['embedding']
 
-        # 3. Lưu vào DB
-        chunks_collection.delete_many({"EventId": ObjectId(event_id_str)})
+        chunks_collection.delete_many({"eventId": event_id_str})
+
         chunks_to_insert = [{
-            "EventId": ObjectId(event_id_str),
-            "Content": chunk_text,
-            "Embedding": embeddings[i]
-        } for i, chunk_text in enumerate(text_chunks)]
+            "eventId": event_id_str,
+            "content": chunk_content,
+            "embedding": embeddings[i]
+        } for i, chunk_content in enumerate(text_chunks)]
 
         if chunks_to_insert:
             chunks_collection.insert_many(chunks_to_insert)
@@ -233,74 +253,120 @@ def ingest_knowledge():
         return jsonify({"status": "success", "chunks_created": len(chunks_to_insert)}), 200
 
     except Exception as e:
-        logger.exception(f"Lỗi khi xử lý kiến thức: {e}")
-        return jsonify({"error": "Lỗi phía AI service khi xử lý tài liệu."}), 500
+        logger.exception(f"Error during knowledge ingestion: {e}")
+        return jsonify({"error": "Error on AI service while processing document."}), 500
 
-@app.route('/process-chat-request-stream', methods=['POST'])
+@app.route('/ai/process-chat-request-stream', methods=['POST'])
 def process_chat_request_stream():
     """
     Endpoint chính để xử lý câu hỏi của người dùng.
     """
-    if not mongo_client: return Response("Lỗi dịch vụ: Không thể kết nối DB.", status=503)
+    if not mongo_client:
+        return Response("Service error: Unable to connect to DB.", status=503)
 
     data = request.get_json()
     if not data or 'user_question' not in data:
-        return jsonify({"error": "Thiếu user_question"}), 400
+        return jsonify({"error": "Missing user_question"}), 400
 
     user_question = data['user_question']
     event_id = data.get('eventId')
 
     try:
-        # Bước 1: Xác định EventID nếu chưa có
         if not event_id:
-            all_events = list(events_collection.find({}, {"EventName": 1}))
-            event_names = [event.get("EventName") for event in all_events if event.get("EventName")]
+            all_events = list(events_collection.find({}, {"eventName": 1}))
+            event_names = [event.get("eventName") for event in all_events if event.get("eventName")]
 
             ner_model = genai.GenerativeModel('gemini-1.5-flash')
-            ner_prompt = f"Từ danh sách tên sự kiện sau: {event_names}. Tên sự kiện nào được nhắc đến trong câu hỏi: \"{user_question}\"? Trả về chính xác tên đó, hoặc 'None' nếu không có."
+            ner_prompt = f"From the following list of event names: {event_names}. Which event name is mentioned in the question: \"{user_question}\"? Return the exact name, or 'None' if not found."
             ner_response = ner_model.generate_content(ner_prompt)
             found_event_name = ner_response.text.strip()
 
             if found_event_name != 'None':
-                found_event = events_collection.find_one({"EventName": found_event_name})
-                if found_event: event_id = str(found_event.get("_id"))
+                found_event = events_collection.find_one({"eventName": found_event_name})
+                if found_event:
+                    event_id = str(found_event.get("_id"))
             else:
-                return Response("Để hỗ trợ tốt hơn, bạn vui lòng cho biết bạn đang hỏi về sự kiện nào ạ?",
+                return Response("To better assist you, please specify which event you are asking about.",
                                 mimetype='text/plain; charset=utf-8')
-
-        # Bước 2: Truy xuất thông tin (Retrieval)
-        question_embedding = \
-        genai.embed_content(model="models/text-embedding-004", content=[user_question], task_type="RETRIEVAL_QUERY")[
-            'embedding'][0]
+        logger.info(f"Using eventId for vector search filter: {event_id}")
+        question_embedding = genai.embed_content(
+            model="models/text-embedding-004",
+            content=[user_question],
+            task_type="RETRIEVAL_QUERY"
+        )['embedding'][0]
 
         pipeline = [
-            {"$vectorSearch": {"index": "knowledge_vector_index", "path": "Embedding",
-                               "queryVector": question_embedding, "numCandidates": 100, "limit": 3}},
-            {"$match": {"EventId": ObjectId(event_id)}},
-            {"$project": {"Content": 1}}
+            {
+                "$search": {
+                    "index": "default",  # Tên index bạn vừa tạo ở trên
+                    "text": {
+                        "query": user_question,  # Dùng câu hỏi của người dùng để tìm kiếm
+                        "path": "content"  # Tìm trong trường "content" của collection chunks
+                    }
+                }
+            },
+            {
+                "$limit": 3  # Lấy 3 kết quả phù hợp nhất
+            },
+            {
+                "$project": {
+                    "content": 1,
+                    "score": {"$meta": "searchScore"}
+                }
+            }
         ]
         relevant_chunks = list(chunks_collection.aggregate(pipeline))
         context = "\n\n".join(
-            [chunk.get("Content", "") for chunk in relevant_chunks]) or "Không tìm thấy thông tin chi tiết."
+            [chunk.get("content", "") for chunk in relevant_chunks]) or "No detailed information found."
 
-        # Bước 3: Sinh câu trả lời (Generation)
         generation_model = genai.GenerativeModel('gemini-1.5-flash')
-        final_prompt = f"Dựa vào thông tin sau: \"{context}\". Hãy trả lời câu hỏi: \"{user_question}\""
+        final_prompt = f"Based on the following information: \"{context}\". Answer the question: \"{user_question}\""
 
         response_stream = generation_model.generate_content(final_prompt, stream=True)
 
         def generate():
             for chunk in response_stream:
-                if chunk.text: yield chunk.text
+                if chunk.text:
+                    yield chunk.text
 
+        logger.info(f"Streamed response generated for question: '{user_question}'")
         return Response(generate(), mimetype='text/plain; charset=utf-8')
 
     except Exception as e:
-        logger.exception(f"Lỗi trong quá trình xử lý chat: {e}")
-        return Response("Đã xảy ra lỗi trong quá trình xử lý.", status=500)
+        logger.exception(f"Error during chat processing: {e}")
+        return Response("An error occurred during processing.", status=500)
 
+@app.route('/ai/suggest-quantity', methods=['POST'])
+def suggest_quantity():
+    if model is None:
+        return jsonify({"error": "Model is not loaded"}), 500
 
+    json_data = request.get_json()
+    if not json_data or 'eventId' not in json_data:
+        return jsonify({"error": "Request body must contain 'eventId'"}), 400
+
+    event_id = json_data['eventId']
+
+    try:
+        # Lấy toàn bộ features từ DB
+        features = get_features_for_suggestion(event_id)
+        if features is None:
+            return jsonify({"error": f"Could not retrieve data for event_id {event_id}"}), 404
+
+        # Chuẩn bị dữ liệu và dự đoán
+        new_event_df = pd.DataFrame([features])
+        new_event_encoded = pd.get_dummies(new_event_df, drop_first=True)
+        final_new_event = new_event_encoded.reindex(columns=model_columns, fill_value=0)
+        prediction_quantity = model.predict(final_new_event)
+
+        # Trả về kết quả
+        return jsonify({"suggested_quantity": int(prediction_quantity[0])})
+
+    except Exception as e:
+        print(f"An error occurred during prediction: {e}")
+        return jsonify({"error": "An internal error occurred."}), 500
+
+preload_models()
+_initialize_models()
 if __name__ == '__main__':
-    initialize_and_train()
-    preload_models()
     app.run(host='0.0.0.0', port=5001, debug=False)
