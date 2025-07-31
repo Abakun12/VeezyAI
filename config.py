@@ -12,7 +12,17 @@ FEEDBACK_COLLECTION = "Feedbacks"
 FOLLOW_COLLECTION = "Follows"
 COMMENT_COLLECTION = "Comments"
 KNOWLEDGE_CHUNKS_COLLECTION = "KnowledgeChunks"
+FACE_LOGS_COLLECTION = "FaceLogs"
+NEWS_COLLECTION = "News"
+FOLLOWS_COLLECTION = "Follows"
+CATEGORIES_COLLECTION = "Categories"
 
+
+MODEL_DIR = "saved_models"
+MODEL_FILE = "ticket_suggestion_model.pkl"
+COLUMNS_FILE = "suggestion_model_columns.pkl"
+CATEGORY_MAP_FILE = "category_avg_map.pkl"
+CITY_MAP_FILE = "city_avg_map.pkl"
 
 # --- Cấu hình Model recognition face ---
 MODEL_NAME = "Facenet"
