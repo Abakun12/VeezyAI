@@ -65,6 +65,10 @@ def enroll_or_update_face():
         )
         new_embedding = embedding_objects[0]['embedding']
 
+        if len(embedding_objects) != 1:
+            logger.warning(f"Ảnh không hợp lệ. Phát hiện {len(embedding_objects)} khuôn mặt.")
+            return jsonify({'error': "Please make sure there is only one face in the photo."}), 400
+
         # 1. Base query: find all accounts that already have an embedding
         query = {"faceEmbedding": {"$exists": True, "$ne": None}}
 
@@ -204,6 +208,10 @@ def buy_ticket_by_face():
         if not embedding_objs or not isinstance(embedding_objs, list) or not embedding_objs[0]:
             return jsonify({"error": "Do not extract facial features from images."}), 400
 
+        if len(embedding_objs) != 1:
+            logger.warning(f"Ảnh không hợp lệ. Phát hiện {len(embedding_objs)} khuôn mặt.")
+            return jsonify({'error': "Please make sure there is only one face in the photo."}), 400
+
         embedding_vector = embedding_objs[0]['embedding']
         logger.info(f"Successfully extracted new face embedding for EventId: {event_id}")
         # Try vấn FaceLogs với eventId, so sánh embedding
@@ -213,7 +221,7 @@ def buy_ticket_by_face():
         pipeline = [
             {
                 "$search": {
-                    "index": "your_face_logs_index_name",
+                    "index": "vector_index_face_logs",
                     "knnBeta": {
                         "vector": embedding_vector,
                         "path": "faceEmbedding",

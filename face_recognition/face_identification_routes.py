@@ -159,7 +159,7 @@ def identify_face_from_image_and_db():
 
 def identify_face_for_check_in():
     """
-    Nhận eventId + ảnh khuôn mặt, truy vấn FaceLogs, nếu tìm thấy embedding khớp thì trả về orderId.
+    Nhận eventsId + ảnh khuôn mặt, truy vấn FaceLog, nếu tìm thấy embedding khớp thì trả về orderId.
     Nếu không tìm thấy thì trả về lỗi.
     """
     if face_logs_collection is None:
@@ -191,6 +191,10 @@ def identify_face_for_check_in():
         if not embedding_objs or not isinstance(embedding_objs, list) or not embedding_objs[0]:
             return jsonify({"error": "Do not extract facial features from images."}), 400
 
+        if len(embedding_objs) != 1:
+            logger.warning(f"Ảnh không hợp lệ. Phát hiện {len(embedding_objs)} khuôn mặt.")
+            return jsonify({'error': "Please make sure there is only one face in the photo."}), 400
+
         live_embedding_vector = embedding_objs[0]['embedding']
 
         CHECKIN_THRESHOLD_DISTANCE = 0.30
@@ -199,7 +203,7 @@ def identify_face_for_check_in():
         pipeline = [
             {
                 "$search": {
-                    "index": "your_face_logs_index_name",
+                    "index": "vector_index_face_logs",
                     "knnBeta": {
                         "vector": live_embedding_vector,
                         "path": "faceEmbedding",
