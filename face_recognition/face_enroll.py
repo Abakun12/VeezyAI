@@ -6,6 +6,7 @@ import logging
 from flask import request, jsonify
 from pymongo import MongoClient
 import config
+from face_recognition import embedding_service
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -20,6 +21,11 @@ try:
     face_logs_collection = db[config.FACE_LOGS_COLLECTION]
     account_face_collection = db[config.ACCOUNTS_COLLECTION]
     logger.info(f"Successfully connected to MongoDB.")
+
+    logging.info("Initializing Custom Embedding Service...")
+    # Không cần truyền embedding_dim vì model đã có sẵn
+    custom_embedding_service = embedding_service.CustomEmbeddingService(model_path=config.CUSTOM_MODEL_PATH)
+    logging.info("Custom Embedding Service initialized successfully.")
 except Exception as e:
     logger.exception(f"INITIAL MONGODB CONNECTION FAILED: {e}. The service might not function correctly.")
     mongo_client = None
@@ -197,22 +203,37 @@ def buy_ticket_by_face():
         if img_cv2 is None:
             return jsonify({"error": "Cannot read image"}), 400
         logger.info(f"Image read successfully for EventId: {event_id}")
-        embedding_objs = DeepFace.represent(
+        all_faces = DeepFace.extract_faces(
             img_path=img_cv2,
-            model_name=MODEL_NAME,
             detector_backend=DETECTOR_NAME,
             enforce_detection=True,
             anti_spoofing=True,
             align=True
         )
-        if not embedding_objs or not isinstance(embedding_objs, list) or not embedding_objs[0]:
-            return jsonify({"error": "Do not extract facial features from images."}), 400
 
-        if len(embedding_objs) != 1:
-            logger.warning(f"Ảnh không hợp lệ. Phát hiện {len(embedding_objs)} khuôn mặt.")
-            return jsonify({'error': "Please make sure there is only one face in the photo."}), 400
+        if not all_faces:
+            logger.warning("Không tìm thấy khuôn mặt nào trong ảnh đăng ký.")
+            return jsonify({"error": "No face detected in the photo."}), 400
 
-        embedding_vector = embedding_objs[0]['embedding']
+        # 2. Tìm khuôn mặt có diện tích lớn nhất
+        largest_face_obj = None
+        max_area = 0
+        for face_obj in all_faces:
+            facial_area = face_obj['facial_area']
+            area = facial_area['w'] * facial_area['h']
+            if area > max_area:
+                max_area = area
+                largest_face_obj = face_obj
+
+        logger.info(f"Phát hiện {len(all_faces)} khuôn mặt, đã chọn khuôn mặt lớn nhất để đăng ký.")
+
+        # 3. Trích xuất embedding CHỈ TỪ khuôn mặt lớn nhất
+        embedding_vector = DeepFace.represent(
+            img_path=largest_face_obj['face'],
+            model_name=MODEL_NAME,
+            enforce_detection=False,
+            detector_backend='skip'
+        )[0]['embedding']
         logger.info(f"Successfully extracted new face embedding for EventId: {event_id}")
         # Try vấn FaceLogs với eventId, so sánh embedding
 
@@ -220,21 +241,19 @@ def buy_ticket_by_face():
 
         pipeline = [
             {
-                "$search": {
-                    "index": "vector_index_face_logs",
-                    "knnBeta": {
-                        "vector": embedding_vector,
-                        "path": "faceEmbedding",
-                        "k": 1,
-                        "filter": {
-                            "equals": {"path": "eventId", "value": event_id}
-                        }
+                '$vectorSearch': {
+                    "index": "face_logs_vector_index",  # <-- Dùng tên index duy nhất bạn đã tạo
+                    "path": "faceEmbedding",
+                    "queryVector": embedding_vector,
+                    "numCandidates": 10,
+                    "limit": 1,
+                    "filter": {
+                        "eventId": event_id
                     }
                 }
             },
             {
-                # Lấy cả embedding đã lưu để so sánh lại
-                "$project": {"faceEmbedding": 1, "score": {"$meta": "searchScore"}}
+                "$project": {"faceEmbedding": 1, "score": {"$meta": "vectorSearchScore"}}
             }
         ]
         logger.info(f"Executing Atlas Search pipeline for EventId {event_id}: {pipeline}")
@@ -286,3 +305,136 @@ def buy_ticket_by_face():
         logger.exception(f"Lỗi không xác định: {str(e)}")
 
         return jsonify({"error": f"Unknown system error: {str(e)}"}), 500
+
+
+def check_image_sharpness(image_np, threshold):
+    """Kiểm tra xem ảnh có bị mờ hay không bằng phương sai của Laplacian."""
+    if image_np is None or image_np.size == 0:
+        return False, "Invalid image for sharpness check."
+    gray = cv2.cvtColor(image_np, cv2.COLOR_BGR2GRAY)
+    variance = cv2.Laplacian(gray, cv2.CV_64F).var()
+    if variance < threshold:
+        logging.warning(f"Image too blurry. Laplacian variance: {variance:.2f} < {threshold}")
+        return False, "Image is too blurry. Please use a sharper photo."
+    logging.info(f"Sharpness check passed. Variance: {variance:.2f}")
+    return True, "Image is sharp enough."
+
+def check_image_brightness(image_np, threshold):
+    """Kiểm tra xem ảnh có quá tối hay không bằng độ sáng trung bình."""
+    if image_np is None or image_np.size == 0:
+        return False, "Invalid image for brightness check."
+    gray = cv2.cvtColor(image_np, cv2.COLOR_BGR2GRAY)
+    brightness = gray.mean()
+    if brightness < threshold:
+        logging.warning(f"Image too dark. Mean brightness: {brightness:.2f} < {threshold}")
+        return False, "Image is too dark. Please use better lighting."
+    logging.info(f"Brightness check passed. Mean brightness: {brightness:.2f}")
+    return True, "Image is bright enough."
+
+def enroll_or_update_face_custom_model():
+    """
+    Xử lý đăng ký hoặc cập nhật khuôn mặt bằng model tùy chỉnh,
+    với logic kiểm tra trùng lặp từ database thật.
+    """
+    if not custom_embedding_service:
+        return jsonify({"error": "System error: Embedding service is not available."}), 500
+
+    # ----- Lấy thông tin từ request (giữ nguyên) -----
+    if 'file' not in request.files:
+        return jsonify({"error": "The 'file' field is not present in the request."}), 400
+
+    file = request.files['file']
+    account_id_to_update = request.form.get('accountId')  # Tùy chọn, dùng khi update
+
+    try:
+        # ----- Xử lý ảnh và trích xuất embedding bằng model tùy chỉnh -----
+        np_image = np.frombuffer(file.read(), np.uint8)
+        img_cv2 = cv2.imdecode(np_image, cv2.IMREAD_COLOR)
+
+        logging.info("Step 1: Detecting face, checking for liveness and validity...")
+        face_objs = DeepFace.extract_faces(
+            img_path=img_cv2,
+            detector_backend=config.DETECTOR_NAME_1,
+            enforce_detection=True,
+            anti_spoofing=True
+        )
+
+        if len(face_objs) != 1:
+            return jsonify({'error': "Please make sure there is only one face in the photo."}), 400
+
+        face_crop_np = (face_objs[0]['face'] * 255).astype(np.uint8)
+        # 3.3: Kiểm tra độ mờ (Blur)
+        is_sharp, sharp_message = check_image_sharpness(face_crop_np, config.MIN_BLUR_THRESHOLD)
+        if not is_sharp:
+            return jsonify({"error": "The photo is blurry."}), 400
+
+        # 3.4: Kiểm tra độ sáng (Brightness)
+        is_bright, bright_message = check_image_brightness(face_crop_np, config.MIN_BRIGHTNESS_THRESHOLD)
+        if not is_bright:
+            return jsonify({"error": "The photo is not bright enough."}), 400
+
+        logging.info("All quality checks passed.")
+
+        logging.info("Step 2: Extracting embedding using custom model...")
+        new_embedding = custom_embedding_service.get_embedding(face_crop_np)
+
+        # <<< LOGIC DATABASE THẬT CỦA BẠN BẮT ĐẦU TỪ ĐÂY >>>
+        # =======================================================
+        logging.info("Step 3: Checking for duplicates in the database...")
+
+        # 1. Xây dựng câu truy vấn cơ bản
+        query = {"faceEmbedding": {"$exists": True, "$ne": None}}
+
+        # 2. Nếu là UPDATE, loại trừ chính tài khoản đó ra khỏi việc kiểm tra
+        if account_id_to_update:
+            logging.info(f"Performing an UPDATE for AccountId: {account_id_to_update}. Excluding it from check.")
+            # Quan trọng: Cần chuyển đổi string ID từ request thành ObjectId của MongoDB
+            try:
+                query["_id"] = {"$ne": account_id_to_update}
+            except Exception:
+                return jsonify({"error": "Invalid accountId format."}), 400
+        else:
+            logging.info("Performing a NEW enrollment. Checking against all existing accounts.")
+
+        # 3. Thực thi truy vấn - Lấy về tất cả các tài khoản khác để so sánh
+        # ⚠️ Cảnh báo hiệu năng: Sẽ chậm khi DB lớn
+        existing_accounts_to_check = list(account_face_collection.find(query))
+        logging.info(f"Found {len(existing_accounts_to_check)} other accounts with embeddings to compare against.")
+
+        # 4. Vòng lặp so sánh với ngưỡng tùy chỉnh từ file config
+        for account in existing_accounts_to_check:
+            stored_embedding = account.get("faceEmbedding")
+            if stored_embedding:
+                # Sử dụng distance metric và ngưỡng từ file config
+                distance = verification.find_distance(
+                    new_embedding,
+                    np.array(stored_embedding),
+                    config.DISTANCE_METRIC_1
+                )
+
+                logging.info(f"Comparing with AccountId: {account.get('_id')}. Distance: {distance:.4f}")
+
+                # So sánh với ngưỡng ĐĂNG KÝ
+                if distance < config.CUSTOM_ENROLL_THRESHOLD:
+                    logging.warning(
+                        f"Enrollment failed. Face is too similar to existing AccountId: {account.get('_id')}. Distance: {distance:.4f}"
+                    )
+                    return jsonify({"error": "This face is already registered to another account."}), 409
+
+        # =======================================================
+        # <<< LOGIC DATABASE THẬT CỦA BẠN KẾT THÚC TẠI ĐÂY >>>
+
+        # Nếu không tìm thấy trùng lặp, trả về kết quả thành công
+        logging.info("Face is unique. Enrollment can proceed.")
+        response_data = {
+            "message": "Valid face, can be registered or updated.",
+            "embedding": new_embedding.tolist()  # Chuyển sang list để lưu vào JSON/DB
+        }
+        return jsonify(response_data), 200
+
+    except ValueError as ve:
+        logging.warning(f"Face processing error: {ve}")
+        return jsonify({"error": str(ve)}), 400
+    except Exception as e:
+        logging.error(f"An unexpected error occurred during enrollment: {e}", exc_info=True)
+        return jsonify({"error": "A system error occurred."}), 500

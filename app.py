@@ -7,11 +7,10 @@ import google.generativeai as genai
 import config
 import pandas as pd
 import data_loader
-from bson import ObjectId
 from pymongo import MongoClient
 from ticket_suggestion_model.prediction_api import get_features_for_suggestion
-from face_recognition.face_enroll import enroll_or_update_face, preload_models, buy_ticket_by_face
-from face_recognition.face_identification_routes import identify_face_from_image_and_db, identify_face_for_check_in, _initialize_models
+from face_recognition.face_enroll import preload_models, buy_ticket_by_face, enroll_or_update_face_custom_model
+from face_recognition.face_identification_routes import identify_face_for_check_in, _initialize_models, identify_face_from_image_and_db_custom
 from nlp_service.sentiment_analyzer import SentimentAnalyzer
 from nlp_service.aspect_analyzer import analyze_aspects
 from nlp_service.keyword_extractor import  extract_top_keywords
@@ -54,6 +53,8 @@ try:
     logger.info("Đã kết nối Gemini API và MongoDB thành công.")
 except Exception as e:
     logger.error(f"Lỗi khi thiết lập cấu hình Gemini API: {e}")
+
+
 
 @app.route('/')
 def index():
@@ -107,9 +108,9 @@ def recommend_for_user_api():
         return jsonify({"error": "An internal error occurred while generating the suggestion."}), 500
 
 
-@app.route('/ai/enroll', methods=['POST'])
-def enroll_face_endpoint():
-    return enroll_or_update_face()
+# @app.route('/ai/enroll', methods=['POST'])
+# def enroll_face_endpoint():
+#     return enroll_or_update_face()
 
 @app.route('/ai/buy_ticket_enroll_face', methods=['POST'])
 def buy_ticket_by_face_endpoint():
@@ -121,7 +122,7 @@ def buy_ticket_by_face_endpoint():
 
 @app.route('/ai/identify', methods=['POST'])
 def identify_face_endpoint():
-    return identify_face_from_image_and_db()
+    return identify_face_from_image_and_db_custom()
 
 @app.route("/ai/check_in_face", methods=['POST'])
 def handle_check_in_face():
@@ -189,10 +190,43 @@ def analyze_sentiment_endpoint():
 
     return jsonify(final_output)
 
-def chunk_text(text, max_words=200):
-    """Hàm trợ giúp để chia nhỏ văn bản."""
-    words = text.split()
-    return [" ".join(words[i:i + max_words]) for i in range(0, len(words), max_words)]
+
+def create_structured_chunks(event_doc):
+    """
+    Hàm được cập nhật để tạo chunks dựa trên cấu trúc event_doc thực tế bạn cung cấp.
+    """
+    chunks = []
+    event_name = event_doc.get('eventName', 'N/A')
+
+    # Chunk 1: Thông tin trạng thái của sự kiện (Rất quan trọng)
+    # Dựa trên các trường isCancelled, isApproved, rejectionReason
+    status_chunk = f"Regarding the status of the event '{event_name}': "
+    if event_doc.get('isCancelled', False):
+        status_chunk += "This event has been officially cancelled."
+    elif event_doc.get('isApproved') == 'Rejected':
+        reason = event_doc.get('rejectionReason', 'no specific reason was provided')
+        status_chunk += f"This event proposal was rejected by the administrator. The reason is: '{reason}'."
+    elif event_doc.get('isApproved') == 'Approved':
+        status_chunk += "This event has been approved and is scheduled to take place."
+    else:  # Các trường hợp khác như "Pending"
+        status_chunk += "This event is currently awaiting approval from the administrator."
+    chunks.append(status_chunk)
+
+    # Chunk 2: Thông tin tổng quan
+    # Dựa trên các trường eventName, eventDescription
+    overview_chunk = f"Event Overview: The event '{event_name}' is described as: '{event_doc.get('eventDescription', 'N/A')}'."
+    chunks.append(overview_chunk)
+
+    # Chunk 3: Thời gian và địa điểm
+    # Dựa trên các trường eventLocation, startAt, endAt
+    location_chunk = (
+        f"Time and Location: The event is held at '{event_doc.get('eventLocation', 'N/A')}'. "
+        f"It starts at {event_doc.get('startAt')} and ends at {event_doc.get('endAt')}."
+    )
+    chunks.append(location_chunk)
+
+
+    return [chunk for chunk in chunks if chunk]
 
 @app.route('/ai/ingest-knowledge', methods=['POST'])
 def ingest_knowledge():
@@ -215,19 +249,10 @@ def ingest_knowledge():
         if not event_doc:
             return jsonify({"error": f"Event not found for eventId: {event_id_str}"}), 404
 
-        knowledge_text = ""
-        knowledge_text += f"Event Name: {event_doc.get('eventName', 'Not available')}. "
-        knowledge_text += f"Description: {event_doc.get('eventDescription', 'Not available')}. "
-        knowledge_text += f"Location: {event_doc.get('eventLocation', 'Not available')}. "
-        knowledge_text += f"Start Time: {event_doc.get('startAt')}. "
-        knowledge_text += f"End Time: {event_doc.get('endAt')}. "
+        text_chunks = create_structured_chunks(event_doc)
 
-        tags = event_doc.get('tags', [])
-        if tags:
-            knowledge_text += f"Related topics: {', '.join(tags)}. "
-
-        text_chunks = chunk_text(knowledge_text)
         if not text_chunks:
+            logger.warning(f"No processable content found for eventId: {event_id_str}")
             return jsonify({"message": "No content to process."}), 200
 
         embedding_result = genai.embed_content(model="models/text-embedding-004", content=text_chunks,
@@ -245,10 +270,11 @@ def ingest_knowledge():
         if chunks_to_insert:
             chunks_collection.insert_many(chunks_to_insert)
 
+        logger.info(f"Successfully ingested {len(chunks_to_insert)} chunks for eventId: {event_id_str}")
         return jsonify({"status": "success", "chunks_created": len(chunks_to_insert)}), 200
 
     except Exception as e:
-        logger.exception(f"Error during knowledge ingestion: {e}")
+        logger.exception(f"Error during knowledge ingestion for eventId {event_id_str}: {e}")
         return jsonify({"error": "Error on AI service while processing document."}), 500
 
 @app.route('/ai/process-chat-request-stream', methods=['POST'])
@@ -264,58 +290,81 @@ def process_chat_request_stream():
         return jsonify({"error": "Missing user_question"}), 400
 
     user_question = data['user_question']
-    event_id = data.get('eventId')
+    event_id = data.get('eventId')  # eventId có thể có hoặc không
 
     try:
+        # Nếu không có eventId, cố gắng xác định từ câu hỏi
         if not event_id:
-            all_events = list(events_collection.find({}, {"eventName": 1}))
-            event_names = [event.get("eventName") for event in all_events if event.get("eventName")]
+            logger.info("eventId not provided, attempting to find event using MongoDB Text Search.")
 
-            ner_model = genai.GenerativeModel('gemini-1.5-flash')
-            ner_prompt = f"From the following list of event names: {event_names}. Which event name is mentioned in the question: \"{user_question}\"? Return the exact name, or 'None' if not found."
-            ner_response = ner_model.generate_content(ner_prompt)
-            found_event_name = ner_response.text.strip()
+            search_result = events_collection.find_one(
+                {"$text": {"$search": user_question}},
+                {"score": {"$meta": "textScore"}, "_id": 1, "eventName": 1}
+            )
 
-            if found_event_name != 'None':
-                found_event = events_collection.find_one({"eventName": found_event_name})
-                if found_event:
-                    event_id = str(found_event.get("_id"))
+            if search_result:
+                event_id = str(search_result.get("_id"))
+                found_event_name = search_result.get("eventName")
+                logger.info(f"Event identified via Text Search: {found_event_name} (ID: {event_id})")
             else:
-                return Response("To better assist you, please specify which event you are asking about.",
+                logger.warning(f"Could not identify an event for question: '{user_question}'")
+                return Response("For better assistance, please specify which event you are asking about.",
                                 mimetype='text/plain; charset=utf-8')
-        logger.info(f"Using eventId for vector search filter: {event_id}")
+
         question_embedding = genai.embed_content(
             model="models/text-embedding-004",
             content=[user_question],
             task_type="RETRIEVAL_QUERY"
         )['embedding'][0]
 
+        # Sử dụng Atlas Vector Search
+        # THAY THẾ PIPELINE CŨ BẰNG PIPELINE MỚI NÀY
         pipeline = [
             {
-                "$search": {
-                    "index": "default",  # Tên index bạn vừa tạo ở trên
-                    "text": {
-                        "query": user_question,
-                        "path": "content"  # Tìm trong trường "content" của collection chunks
+                '$vectorSearch': {
+                    "index": "ChatBot",
+                    "path": "embedding",
+                    "queryVector": question_embedding,
+                    "numCandidates": 100,  # Thường lớn hơn limit để tăng độ chính xác
+                    "limit": 5,
+                    "filter": {
+                        "eventId": event_id
                     }
                 }
             },
             {
-                "$limit": 3  # Lấy 3 kết quả phù hợp nhất
-            },
-            {
-                "$project": {
-                    "content": 1,
-                    "score": {"$meta": "searchScore"}
+                '$project': {
+                    '_id': 0,
+                    'content': 1,
+                    'score': {'$meta': 'vectorSearchScore'}
                 }
             }
         ]
         relevant_chunks = list(chunks_collection.aggregate(pipeline))
         context = "\n\n".join(
-            [chunk.get("content", "") for chunk in relevant_chunks]) or "No detailed information found."
+            [chunk.get("content", "") for chunk in relevant_chunks]) or "No information found."
 
         generation_model = genai.GenerativeModel('gemini-1.5-flash')
-        final_prompt = f"Based on the following information: \"{context}\". Answer the question: \"{user_question}\""
+
+        # Sử dụng prompt chi tiết
+        final_prompt = f"""
+                You are VeezyAI, a helpful and friendly assistant for the Veezy event platform. Your goal is to answer user questions based ONLY on the information provided below.
+                
+                **Rules:**
+                - Answer in English.
+                - Be concise and straight to the point.
+                - If the information is not available in the context below, you MUST say: "Sorry, I don't have information on this issue. Please ask about another topic related to the event."
+                - Do not make up answers.
+                
+                **Provided Information:**
+                ---
+                {context}
+                ---
+                
+                **User's Question:** "{user_question}"
+                
+                **Your Answer:**
+                """
 
         response_stream = generation_model.generate_content(final_prompt, stream=True)
 
@@ -360,6 +409,10 @@ def suggest_quantity():
     except Exception as e:
         print(f"An error occurred during prediction: {e}")
         return jsonify({"error": "An internal error occurred."}), 500
+
+@app.route("/ai/enroll", methods=['POST'])
+def enroll_face_custom_model_endpoint():
+    return enroll_or_update_face_custom_model()
 
 preload_models()
 _initialize_models()

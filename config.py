@@ -71,3 +71,29 @@ ASPECT_KEYWORDS = {
     # Khía cạnh về Hình ảnh và Sản xuất
     "Visuals/Production": ["lights", "lighting", "visuals", "screen", "video", "effects", "production"]
 }
+
+# File: config.py
+
+# Cấu hình cho model tùy chỉnh
+CUSTOM_MODEL_PATH = "face_recognition/arcface_backbone.pth"
+# Kích thước embedding của InceptionResnetV1 là 512
+EMBEDDING_DIMENSION = 512
+
+# --- THÔNG SỐ QUAN TRỌNG NHẤT TỪ FILE HUẤN LUYỆN ---
+# 1. ĐO LƯỜNG KHOẢNG CÁCH
+DISTANCE_METRIC_1 = 'euclidean' # Phải khớp với `euclidean` bạn dùng
+
+# 2. NGƯỠNG ĐĂNG NHẬP
+# Lấy giá trị `best_threshold` bạn tìm được. Ví dụ: 0.9543
+CUSTOM_LOGIN_THRESHOLD = 0.3
+
+# 3. NGƯỠNG ĐĂNG KÝ
+# Nên nghiêm ngặt hơn (nhỏ hơn) ngưỡng đăng nhập một chút để đảm bảo tính duy nhất.
+# Bạn có thể điều chỉnh giá trị này.
+CUSTOM_ENROLL_THRESHOLD = 0.23
+
+# Cấu hình khác
+DETECTOR_NAME_1 = "mtcnn"
+
+MIN_BRIGHTNESS_THRESHOLD = 70  # Yêu cầu độ tự tin phát hiện mặt phải trên 90%
+MIN_BLUR_THRESHOLD = 14
